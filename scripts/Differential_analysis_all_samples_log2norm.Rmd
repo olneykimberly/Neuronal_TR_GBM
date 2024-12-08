@@ -1,0 +1,573 @@
+---
+title: "Quality control and differential analysis"
+author: "Kimberly Olney, PhD"
+date: "2024-12-04"
+output: html_document
+---
+
+# Set up
+```{r setup}
+knitr::opts_knit$set(root.dir = ".")
+```
+
+```{r libraries}
+# Load required libraries
+library(tidyverse)
+library(ggplot2)
+library(pheatmap)
+library(limma)
+library(edgeR)
+library(vsn)
+library(ggrepel)
+library(xlsx)
+library(openxlsx)
+```
+
+# Input
+26ip: contains IP pulldown/eluted sample data
+12input: contains input sample data (samples that did not undergo IP pulldown, i.e., the material we started with)
+```{r input}
+# Load data
+raw_ip_data <- read.delim("../raw/MS2_raw_26ip.txt") # MS2_raw_26ip.txt SB28_log2_proteomics.tsv
+nsamples <- ncol(raw_ip_data[6:31]) # Number of samples
+raw_ip_counts <- raw_ip_data[6:31] # Just the counts 
+# Three of the tumor samples didn't graph well. We will consider removing:
+# TR_SB28_M_1_elut, TR_SB28_M_2_elut, TR_SB28_M_3_elut
+# NOTE if removing be sure to update the columns selected accordingling!! 
+
+# Select only the first five columns
+protein_accession <- raw_ip_data[, c(1:5)]
+rownames(raw_ip_counts) <- protein_accession$PG.Genes
+
+# Rename the columns to remove everything after "elut"
+colnames(raw_ip_counts) <- gsub("elut.*", "elut", colnames(raw_ip_counts))
+metadata <- read.delim("../metadata/SB28_26ip_metadata.tsv")
+# Keep only metadata information for samples in the counts matrix
+metadata <- subset(metadata, simplified_name %in% colnames(raw_ip_counts))
+
+# Order metadata by matching simplified_name to the column names of raw_ip_counts
+#metadata <- metadata[match(colnames(raw_ip_counts), metadata$simplified_name), ]
+
+metadata$treatment <- factor(metadata$treatment, levels = c("sham", "SB28/tumor"))
+metadata$sex <- factor(metadata$sex, levels = c("F", "M"))
+
+# Treatment and genotype
+metadata$treatment_genotype <- paste(metadata$treatment, metadata$genotype, sep = "_")
+metadata$treatment_genotype <- gsub("SB28/tumor_WT", "SB28_WT", metadata$treatment_genotype)
+metadata$treatment_genotype <- gsub("SB28/tumor_TR", "SB28_TR", metadata$treatment_genotype)
+metadata$treatment_genotype <- factor(metadata$treatment_genotype, levels = c("sham_WT", "sham_TR", "SB28_WT", "SB28_TR"))
+```
+
+# Variables
+```{r variables}
+SexColors <- c("purple", "orange")
+TreatmentColors <- c("lightblue", "black")
+TreatmentGenotypeColors <- c("lightblue", "blue", "gray", "black")
+```
+
+# Counts checks
+```{r missing_data}
+# Check missing values as a percentage for each protein
+missing_vals <- colSums(is.na(raw_ip_data))
+missing_vals_percent <- (missing_vals / nrow(raw_ip_data)) * 100
+print(missing_vals_percent)
+
+# Visualize missing values distribution
+pdf("../log2_normalized_all_samples/library/missing_counts_per_sample.pdf", height = 5, width = 7)
+ggplot(data.frame(Proteins = rownames(raw_ip_data), MissingPercent = rowMeans(is.na(raw_ip_data))), 
+       aes(x = MissingPercent)) +
+  geom_histogram(bins = 30, fill = "blue") +
+  theme_classic()+  
+  labs(title = "Distribution of Missing Values per Protein", x = "Missing Percentage", y = "Frequency")
+dev.off()
+
+# Summarize missing data on a per sample 
+missing_summary <- colSums(is.na(raw_ip_counts))
+print(missing_summary)
+
+# Visualize missing data pattern
+missing_df <- data.frame(Sample = colnames(raw_ip_counts), Missing = missing_summary)
+
+# Ensure Sample is a factor with levels in the correct order
+missing_df$Sample <- factor(missing_df$Sample, levels = colnames(raw_ip_counts))
+
+pdf("../log2_normalized_all_samples/library/missing_counts_per_sample.pdf", height = 5, width = 7)
+ggplot(missing_df, aes(x = Sample, y = Missing)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  labs(title = "Missing Counts Per Sample", x = "Sample", y = "Count of Missing Proteins") +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1)  # Rotate X-axis labels to 90 degrees
+  )
+dev.off()
+# min value?
+min(raw_ip_counts, na.rm = TRUE) 
+```
+
+# Counts distribution 
+Handling Missing Values: Imputation vs. Replacement
+- Random missingness: Caused by technical noise; imputation is often acceptable here.
+- Systematic missingness: Proteins are below the detection limit in specific conditions; this may be biologically meaningful.
+Since missing values is largely systematic, replacing missing values with a small constant is better for preserving biological meaning.
+```{r counts_distribution}
+# Visualize counts distribution
+# set graphical parameter
+par(mfrow = c(1,2))
+
+# set colors
+colors <- TreatmentGenotypeColors[metadata$treatment_genotype]
+
+# First, plot the first column of the counts density
+plot(density(na.omit(raw_ip_counts[,1])), col = colors[1],  lwd = 2, ylim = c(0,0.5), 
+     las = 2, main = "A. Counts\nOmit missing counts", xlab = expression('Counts'))
+# For each sample plot the counts density
+for (i in 1:nsamples){
+  den <- density(na.omit(raw_ip_counts[,i])) #subset each column
+  lines(den$x, den$y, col = colors[i],  lwd = 2) 
+}
+
+# Replace NA with min_value/2; which is half that of the lowest value 
+min_value <- min(raw_ip_counts, na.rm = TRUE) 
+raw_ip_counts[is.na(raw_ip_counts)] <- (min_value/2)
+plot(density(raw_ip_counts[,1]), col = colors[1], lwd = 2, ylim = c(0,0.5), 
+     las = 2, main = "B. Missing counts\n Set to half of the min value", xlab = expression('Counts'))
+# For each sample plot the counts density
+for (i in 1:nsamples){
+  den <- density(raw_ip_counts[,i]) #subset each column
+  lines(den$x, den$y, col = colors[i], lwd = 2) 
+}
+```
+# vsn mormalization 
+```{r vsn}
+counts <- raw_ip_counts # to make clear that it is no longer the raw values
+# missing values have been replaced with small value 
+counts_matrix <- as.matrix(counts)
+# Apply VSN normalization
+vsn_fit <- vsn2(counts_matrix)
+meanSdPlot(vsn_fit, ranks = TRUE)
+data_vsn <- predict(vsn_fit, newdata = counts_matrix)
+
+# Just the TR samples
+TR_counts <- counts[7:26] # Just the TR
+# missing values have been replaced with small value 
+TR_counts_matrix <- as.matrix(TR_counts)
+# Apply VSN normalization
+TR_vsn_fit <- vsn2(TR_counts_matrix)
+meanSdPlot(TR_vsn_fit, ranks = TRUE)
+TR_data_vsn <- predict(TR_vsn_fit, newdata = TR_counts_matrix)
+```
+The red dots, connected by lines, show the running median of the standard deviation. The aim of these plots is to see whether there is a systematic trend in the standard deviation of the data as a function of overall expression. The assumption that underlies the usefulness of these plots is that most genes are not differentially expressed, so that the running median is a reasonable estimator of the standard deviation of feature level data conditional on the mean. After variance stabilization, this should be approximately a horizontal line. It may have some random fluctuations, but should not show an overall trend. If this is not the case, that usually indicates a data quality problem, or is a consequence of inadequate prior data preprocessing. The rank ordering distributes the data evenly along the x.
+
+# log2 normalize
+the vsn method isn't going to work for all samples. We will log2 normalize instead
+```{r log2}
+log2_counts <- log2(counts_matrix)
+```
+
+# PCA
+```{r PCA_post_vsn}
+# PCA plot
+pca <- prcomp(t(counts_matrix), scale. = TRUE)
+explained_variance <- pca$sdev^2 / sum(pca$sdev^2) * 100
+
+# PCA plot
+pca_data <- as.data.frame(pca$x)
+pca_data$treatment <- metadata$treatment_genotype
+
+# PCA plot visualization
+pdf("../log2_normalized_all_samples/variance/PCA.pdf", height = 5, width = 7)
+ggplot(pca_data, aes(x = PC1, y = PC2, color = treatment)) +
+  geom_point(size = 3) +
+  theme_minimal() +
+  labs(title = "PCA of Proteomics Data", 
+       x = paste0("PC1 (", round(explained_variance[1], 1), "%)"), 
+       y = paste0("PC2 (", round(explained_variance[2], 1), "%)")) +
+  scale_color_manual(values = TreatmentGenotypeColors)
+dev.off()
+```
+
+```{r PCA_post_vsn_only_TR}
+# PCA plot
+pca <- prcomp(t(TR_data_vsn), scale. = TRUE)
+explained_variance <- pca$sdev^2 / sum(pca$sdev^2) * 100
+
+# PCA plot
+pca_data <- as.data.frame(pca$x)
+TR_metadata <- subset(metadata, genotype == "TR")
+pca_data$treatment <- TR_metadata$treatment_genotype
+pca_data$sample <- TR_metadata$simplified_name
+
+# PCA plot visualization
+pdf("../log2_normalized_all_samples/variance/PCA_TR_only.pdf", height = 5, width = 7)
+ggplot(pca_data, aes(x = PC1, y = PC2, color = treatment)) +
+  geom_text(aes(label = sample), vjust = -0.5, hjust = 0.5, size = 3) + # adds sample name
+  geom_point(size = 3) +
+  theme_minimal() +
+  labs(title = "PCA of Proteomics Data", 
+       x = paste0("PC1 (", round(explained_variance[1], 1), "%)"), 
+       y = paste0("PC2 (", round(explained_variance[2], 1), "%)")) +
+  scale_color_manual(values = TreatmentGenotypeColors)
+dev.off()
+```
+
+
+# Differential expression analysis
+```{r DE}
+# Check the design matrix
+design <- model.matrix(~ 0 + metadata$treatment_genotype)
+colnames(design) <- gsub("metadata\\$treatment_genotype", "", colnames(design))
+
+# Fit linear model
+fit <- lmFit(log2_counts, design)
+
+# Define contrasts (e.g., Group1 vs Group2)
+contrast_matrix <- makeContrasts(
+  sham_TR_vs_sham_WT = sham_TR - sham_WT, # enrichment of neuronal proteins Turbo-Ribo constructs vs. those that don't
+  SB28_TR_vs_SB28_WT = SB28_TR - SB28_WT, # same as above, and  if the presence of a tumor impacts which proteins get enriched
+  SB28_WT_vs_sham_WT = SB28_WT - sham_WT, # if presence of tumor changes the background biotinylation and protein composition/proteome 
+  SB28_TR_vs_sham_TR = SB28_TR- sham_TR,
+  levels = design)
+
+# save contrast names
+allComparisons <- colnames(contrast_matrix)
+allComparisons # check
+
+# Fit contrasts
+fit2 <- contrasts.fit(fit, contrast_matrix)
+veBayesFit <- eBayes(fit2)
+
+# Extract results
+pval <- 0.05
+lfc.cutoff <- 0.25
+
+sumTable <- 
+  summary(decideTests(
+    veBayesFit,  # object
+    adjust.method = "BH", # by default the method = "separate"
+    p.value = pval,
+    lfc = lfc.cutoff  # numeric, minimum absolute log2-fold change required
+  ))
+
+print(paste0(" q-value < ", pval,
+             " & absolute log2-fold change > ", lfc.cutoff))
+sumTable
+```
+
+
+```{r inspect}
+test2 <- topTable(
+  veBayesFit, 
+  coef = "SB28_TR_vs_sham_TR",  
+  n = Inf, 
+  p.value = 1,
+  lfc = 0, 
+  sort.by = "P", 
+ # genelist = protein_accession, 
+  confint = TRUE # column of confidence interval 
+    )
+
+subset(test2, rownames(test2) == "Mapt")
+```
+
+### Save objects
+```{r save_voom}
+saveRDS(veBayesFit, file = paste0("../rObjects/veBayesFit.rds"))
+```
+
+### Output DEG tables
+```{r DGE_output}
+coef <- 1
+
+for (i in allComparisons) {
+  vTopTableAll <- topTable(
+    veBayesFit, 
+    coef = coef,  
+    n = Inf, 
+    p.value = 1,
+    lfc = 0, 
+    sort.by = "P", 
+    confint = TRUE 
+    )
+  vTopTableAll$PG.Genes <- rownames(vTopTableAll)
+  df <- merge(vTopTableAll, protein_accession, by = "PG.Genes")
+  saveRDS(df, file = paste0("../rObjects/", 
+                   i,"_gene_table.rds"))
+  
+  path <- paste0("../log2_normalized_all_samples/differential/", 
+  i, "_gene_DEGs_q1.00.txt", sep = "") 
+  write.table(
+    df,
+    path,
+    sep = "\t",
+    row.names = FALSE,
+    quote = FALSE
+  )
+  
+  vTopTable1 <- subset(df, (adj.P.Val < 0.05 & logFC > 0.25) | (adj.P.Val < 0.05 & logFC < -0.25))
+  path <- paste0("../log2_normalized_all_samples/differential/", 
+  i, "_gene_DEGs_q0.05_logFC0.25.txt", sep = "") 
+  write.table(
+    vTopTable1,
+    path,
+    sep = "\t",
+    row.names = FALSE,
+    quote = FALSE
+  )
+  coef <- coef + 1  # increment 
+}
+remove(coef, df, vTopTable1, vTopTableAll)
+```
+
+# Volcano plots
+Add label for turbo ID 
+```{r volcano, warning=FALSE}
+q_value_cutoff = 0.05
+logFC_cutoff = 0.25
+for (i in allComparisons) {
+  group1_vs_group2 <-
+    read.delim(
+      paste0("../log2_normalized_all_samples/differential/",
+        i,
+        "_gene_DEGs_q1.00.txt"
+      )
+    )
+  color_values <- vector()
+  max <- nrow(group1_vs_group2)
+  for (row in 1:max) {
+    if (group1_vs_group2$adj.P.Val[row] < 0.05) {
+      if (group1_vs_group2$logFC [row] > 0.25) {
+        color_values <- c(color_values, 1)
+      }
+      else if (group1_vs_group2$logFC[row] < -0.25) {
+        color_values <- c(color_values, 2)
+      }
+      else {
+        color_values <- c(color_values, 3)
+      }
+    }
+    else{
+      color_values <- c(color_values, 3)
+    }
+  }
+  group1_vs_group2$color_adjpval_0.05 <- factor(color_values)
+  data <- group1_vs_group2
+  # plot only if there are DEGs with p_val_adj < 0.05
+  num <- subset(data, (adj.P.Val < 0.05 & logFC < -0.25)  | (adj.P.Val < 0.05 & logFC > 0.25 ))
+  num <- nrow(num)
+  if (num != 0) {
+    up <- data[data$color_adjpval_0.05 == 1,]
+    up10 <- up[1:10,]
+    upFold <- subset(up, logFC > 0)
+    upFold <- upFold[!(upFold$PG.Genes %in% up10$PG.Genes),]
+    down <- data[data$color_adjpval_0.05 == 2,]
+    down10 <- down[1:10,]
+    downFold <- subset(down, logFC < -0)
+    downFold <- downFold[!(downFold$PG.Genes %in% down10$PG.Genes),]
+    if (!1 %in% unique(data$color_adjpval_0.05)) {
+      my_colors <- c("blue", "gray")
+    } else if (!2 %in% unique(data$color_adjpval_0.05)) {
+      my_colors <- c("red", "gray")
+    } else if (!1 %in% unique(data$color_adjpval_0.05) &&
+               !2 %in% unique(data$color_adjpval_0.05)) {
+      my_colors <- c("gray")
+    } else {
+      my_colors <- c("red", "blue", "gray")
+    }
+    hadjpval <- (-log10(max(data$P.Value[data$adj.P.Val < 0.05],
+                            na.rm = TRUE)))
+    negFC <- c(-0.25)
+    posFC <- c(0.25) 
+    
+    title_main <- gsub("_vs_", " versus ", gsub("_", " ", i)) # format group name with parentheses
+    title_sub <- paste("q-value <", q_value_cutoff, "& |log2FC| >", logFC_cutoff)
+    
+    i <- gsub("vs", " versus ", i)
+    p <-
+      ggplot(data = data,
+             aes(
+               x = logFC,
+               y = -log10(P.Value),
+               color = color_adjpval_0.05
+             )) +
+      geom_point(alpha = 0.8, size = 1) +
+      theme_bw() +
+      theme(legend.position = "none") +
+      scale_color_manual(values = my_colors) +
+      labs(
+        title = title_main,
+        subtitle = title_sub,
+        x = expression(log[2](FC)),
+        y = expression(-log[10] ~ "(" ~ italic("p") ~ "-value)")
+      )  +
+      geom_hline(yintercept = hadjpval,
+                 #  horizontal line
+                 colour = "#000000",
+                 linetype = "dashed") +
+      geom_vline(xintercept = negFC,
+                 #  horizontal line
+                 colour = "#000000",
+                 linetype = "dashed") +
+      geom_vline(xintercept = posFC,
+                 #  horizontal line
+                 colour = "#000000",
+                 linetype = "dashed") +
+      geom_text_repel(
+        data = up10,
+        aes(
+          x = logFC,
+          y = -log10(P.Value),
+          label = PG.Genes
+        ),
+        color = "maroon",
+        fontface = "italic",
+        size = 3,
+        max.overlaps = getOption("ggrepel.max.overlaps", default = 5)
+      ) +
+      geom_text_repel(
+        data = upFold,
+        aes(
+          x = logFC,
+          y = -log10(P.Value),
+          label = PG.Genes
+        ),
+        color = "maroon",
+        fontface = "italic",
+        size = 3,
+        max.overlaps = getOption("ggrepel.max.overlaps", default = 5)
+      ) +
+      geom_text_repel(
+        data = down10,
+        aes(
+          x = logFC,
+          y = -log10(P.Value),
+          label = PG.Genes
+        ),
+        color = "navyblue",
+        fontface = "italic",
+        size = 3,
+        max.overlaps = getOption("ggrepel.max.overlaps", default = 5)
+      ) +
+      geom_text_repel(
+        data = downFold,
+        aes(
+          x = logFC,
+          y = -log10(P.Value),
+          label = PG.Genes
+        ),
+        color = "navyblue",
+        fontface = "italic",
+        size = 3,
+        max.overlaps = getOption("ggrepel.max.overlaps", default = 5)
+      )
+    p
+    i <- gsub(" versus ", "vs", i)
+    # save
+    path <-
+      paste0(
+        "../log2_normalized_all_samples/volcano/",
+        i,
+        "_volcano_q0.05_logFC0.25"
+      )
+    pdf(paste0(path, ".pdf"),
+        height = 5,
+        width = 5)
+    print(p)
+    dev.off()
+    
+    print(paste("i =", i))
+  }
+} 
+```
+
+```{r cleanup}
+# clean up
+remove(up, up10, upFold, group1_vs_group2, downFold, down10, data, p)
+```
+
+# Make excel table
+```{r excel}
+# first read in the files
+for (i in allComparisons) {
+  filepath <- paste0("../log2_normalized_all_samples/differential/", 
+  i, "_gene_DEGs_q1.00.txt", sep = "") 
+  assign(paste0(i),
+         read.delim(
+           filepath,
+           header = TRUE,
+           sep = "\t",
+           stringsAsFactors = FALSE
+         ))
+}
+allComparisons
+
+list_of_datasets <- list(
+"sham_TR_vs_sham_WT" = sham_TR_vs_sham_WT,
+"SB28_TR_vs_SB28_WT" = SB28_TR_vs_SB28_WT,     
+"SB28_WT_vs_sham_WT" = SB28_WT_vs_sham_WT,
+"SB28_TR_vs_sham_TR" = SB28_TR_vs_sham_TR        
+)
+
+write.xlsx(list_of_datasets, file = paste0(
+    "../log2_normalized_all_samples/differential/DEGs_q1.00.xlsx"))
+```
+
+clean up
+```{r cleanup_excel}
+remove(
+sham_TR_vs_sham_WT,
+SB28_TR_vs_SB28_WT, 
+SB28_WT_vs_sham_WT,
+SB28_TR_vs_sham_TR
+)
+```
+
+# Excel table of significant DEGs
+```{r}
+# first read in the files
+for (i in allComparisons) {
+  filepath <- paste0("../log2_normalized_all_samples/differential/", 
+  i, "_gene_DEGs_q0.05_logFC0.25.txt", sep = ""
+  )
+  assign(paste0(i),
+         tryCatch(
+         read.delim(
+           filepath,
+           header = TRUE,
+           sep = "\t",
+           stringsAsFactors = FALSE
+         ), error=function(e) NULL))
+}
+
+list_of_datasets <- list(
+"sham_TR_vs_sham_WT" = sham_TR_vs_sham_WT,
+"SB28_TR_vs_SB28_WT" = SB28_TR_vs_SB28_WT,     
+"SB28_WT_vs_sham_WT" = SB28_WT_vs_sham_WT,
+"SB28_TR_vs_sham_TR" = SB28_TR_vs_sham_TR)
+write.xlsx(list_of_datasets, file = paste0("../log2_normalized_all_samples/differential/DEGs_q0.05_logFC0.25.xlsx"))
+```
+
+```{r}
+# Create empty lists to store up-regulated and down-regulated genes dataframes
+up_regulated_genes <- list()
+down_regulated_genes <- list()
+
+# Iterate over each dataframe in list_of_datasets
+for (comparison_name in names(list_of_datasets)) {
+    # Filter for up-regulated genes (logFC > 0)
+    up_regulated_genes[[comparison_name]] <- list_of_datasets[[comparison_name]][list_of_datasets[[comparison_name]]$logFC > 0, ]
+    
+    # Filter for down-regulated genes (logFC < 0)
+    down_regulated_genes[[comparison_name]] <- list_of_datasets[[comparison_name]][list_of_datasets[[comparison_name]]$logFC < 0, ]
+}
+
+# Write up-regulated genes to an Excel file
+up_regulated_file <- paste0("../log2_normalized_all_samples/differential/upregulated_proteins.xlsx")
+write.xlsx(up_regulated_genes, file = up_regulated_file)
+
+# Write down-regulated genes to an Excel file
+down_regulated_file <- paste0("../log2_normalized_all_samples/differential/downregulated_proteins.xlsx")
+write.xlsx(down_regulated_genes, file = down_regulated_file)
+```
+
+
+
